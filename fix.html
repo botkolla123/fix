@@ -1,0 +1,1240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deriv Trading Bot - Automated Digit Differ Trading</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .animate-pulse {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
+        .animate-spin {
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // Deriv API Hook
+        const useDerivAPI = () => {
+            const [connectionStatus, setConnectionStatus] = useState('disconnected');
+            const [isAuthenticated, setIsAuthenticated] = useState(false);
+            const [error, setError] = useState(null);
+            const [accountBalance, setAccountBalance] = useState(null);
+            const [currentTick, setCurrentTick] = useState(null);
+            const [tickHistory, setTickHistory] = useState([]);
+            
+            const wsRef = useRef(null);
+            const tokenRef = useRef(null);
+            const reconnectTimeoutRef = useRef(null);
+            const messageHandlersRef = useRef(new Map());
+
+            const generateReqId = useCallback(() => {
+                return Math.random().toString(36).substring(2, 15);
+            }, []);
+
+            const sendMessage = useCallback((message) => {
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    const messageWithId = {
+                        ...message,
+                        req_id: generateReqId()
+                    };
+                    wsRef.current.send(JSON.stringify(messageWithId));
+                    return messageWithId.req_id;
+                }
+                return null;
+            }, [generateReqId]);
+
+            const handleMessage = useCallback((event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.msg_type === 'authorize') {
+                        if (data.error) {
+                            setError(`Authentication failed: ${data.error.message}`);
+                            setIsAuthenticated(false);
+                        } else {
+                            setIsAuthenticated(true);
+                            setError(null);
+                            sendMessage({ balance: 1, subscribe: 1 });
+                        }
+                    } else if (data.msg_type === 'balance') {
+                        if (data.balance) {
+                            setAccountBalance(data.balance.balance);
+                        }
+                    } else if (data.msg_type === 'tick') {
+                        const tick = {
+                            symbol: data.tick.symbol,
+                            quote: data.tick.quote,
+                            epoch: data.tick.epoch,
+                            lastDigit: data.tick.quote.toString().slice(-1)
+                        };
+                        setCurrentTick(tick);
+                        setTickHistory(prev => [...prev.slice(-99), tick]);
+                    } else if (data.msg_type === 'proposal' || data.msg_type === 'buy' || data.msg_type === 'proposal_open_contract') {
+                        if (messageHandlersRef.current.has(data.req_id)) {
+                            messageHandlersRef.current.get(data.req_id)(data);
+                            if (data.msg_type !== 'proposal_open_contract') {
+                                messageHandlersRef.current.delete(data.req_id);
+                            }
+                        }
+                    }
+
+                    if (data.error) {
+                        setError(`API Error: ${data.error.message}`);
+                    }
+                } catch (err) {
+                    console.error('Error parsing WebSocket message:', err);
+                }
+            }, [sendMessage]);
+
+            const connect = useCallback((token) => {
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    return;
+                }
+
+                setConnectionStatus('connecting');
+                setError(null);
+                tokenRef.current = token;
+
+                try {
+                    wsRef.current = new WebSocket('wss://ws.deriv.com/websockets/v3');
+
+                    wsRef.current.onopen = () => {
+                        setConnectionStatus('connected');
+                        if (token) {
+                            sendMessage({ authorize: token });
+                        }
+                    };
+
+                    wsRef.current.onmessage = handleMessage;
+
+                    wsRef.current.onclose = (event) => {
+                        setConnectionStatus('disconnected');
+                        setIsAuthenticated(false);
+                        
+                        if (event.code !== 1000 && tokenRef.current) {
+                            reconnectTimeoutRef.current = setTimeout(() => {
+                                connect(tokenRef.current);
+                            }, 3000);
+                        }
+                    };
+
+                    wsRef.current.onerror = (error) => {
+                        setError('WebSocket connection error');
+                        setConnectionStatus('disconnected');
+                    };
+                } catch (err) {
+                    setError(`Connection failed: ${err.message}`);
+                    setConnectionStatus('disconnected');
+                }
+            }, [handleMessage, sendMessage]);
+
+            const disconnect = useCallback(() => {
+                if (reconnectTimeoutRef.current) {
+                    clearTimeout(reconnectTimeoutRef.current);
+                }
+                
+                if (wsRef.current) {
+                    wsRef.current.close(1000);
+                }
+                
+                setConnectionStatus('disconnected');
+                setIsAuthenticated(false);
+                setAccountBalance(null);
+                setCurrentTick(null);
+                setTickHistory([]);
+                tokenRef.current = null;
+                messageHandlersRef.current.clear();
+            }, []);
+
+            const subscribeToTicks = useCallback((symbol) => {
+                if (!isAuthenticated) {
+                    setError('Must be authenticated to subscribe to ticks');
+                    return;
+                }
+
+                const reqId = sendMessage({
+                    ticks: symbol,
+                    subscribe: 1
+                });
+
+                return reqId;
+            }, [isAuthenticated, sendMessage]);
+
+            const getProposal = useCallback((contractParams) => {
+                return new Promise((resolve, reject) => {
+                    if (!isAuthenticated) {
+                        reject(new Error('Must be authenticated to get proposals'));
+                        return;
+                    }
+
+                    const reqId = sendMessage({
+                        proposal: 1,
+                        ...contractParams
+                    });
+
+                    if (reqId) {
+                        messageHandlersRef.current.set(reqId, (response) => {
+                            if (response.error) {
+                                reject(new Error(response.error.message));
+                            } else {
+                                resolve(response);
+                            }
+                        });
+
+                        setTimeout(() => {
+                            if (messageHandlersRef.current.has(reqId)) {
+                                messageHandlersRef.current.delete(reqId);
+                                reject(new Error('Proposal request timeout'));
+                            }
+                        }, 10000);
+                    } else {
+                        reject(new Error('Failed to send proposal request'));
+                    }
+                });
+            }, [isAuthenticated, sendMessage]);
+
+            const buyContract = useCallback((proposalId, price) => {
+                return new Promise((resolve, reject) => {
+                    if (!isAuthenticated) {
+                        reject(new Error('Must be authenticated to buy contracts'));
+                        return;
+                    }
+
+                    const reqId = sendMessage({
+                        buy: proposalId,
+                        price: price
+                    });
+
+                    if (reqId) {
+                        messageHandlersRef.current.set(reqId, (response) => {
+                            if (response.error) {
+                                reject(new Error(response.error.message));
+                            } else {
+                                resolve(response);
+                            }
+                        });
+
+                        setTimeout(() => {
+                            if (messageHandlersRef.current.has(reqId)) {
+                                messageHandlersRef.current.delete(reqId);
+                                reject(new Error('Buy request timeout'));
+                            }
+                        }, 10000);
+                    } else {
+                        reject(new Error('Failed to send buy request'));
+                    }
+                });
+            }, [isAuthenticated, sendMessage]);
+
+            const monitorContract = useCallback((contractId, callback) => {
+                if (!isAuthenticated) {
+                    setError('Must be authenticated to monitor contracts');
+                    return;
+                }
+
+                const reqId = sendMessage({
+                    proposal_open_contract: 1,
+                    contract_id: contractId,
+                    subscribe: 1
+                });
+
+                if (reqId && callback) {
+                    messageHandlersRef.current.set(reqId, callback);
+                }
+
+                return reqId;
+            }, [isAuthenticated, sendMessage]);
+
+            useEffect(() => {
+                return () => {
+                    disconnect();
+                };
+            }, [disconnect]);
+
+            return {
+                connectionStatus,
+                isAuthenticated,
+                error,
+                accountBalance,
+                currentTick,
+                tickHistory,
+                connect,
+                disconnect,
+                subscribeToTicks,
+                getProposal,
+                buyContract,
+                monitorContract,
+                sendMessage
+            };
+        };
+
+        // Trading Bot Hook
+        const useTradingBot = (derivAPI) => {
+            const [isRunning, setIsRunning] = useState(false);
+            const [digitSequence, setDigitSequence] = useState([]);
+            const [currentStake, setCurrentStake] = useState(1);
+            const [baseStake, setBaseStake] = useState(1);
+            const [consecutiveLosses, setConsecutiveLosses] = useState(0);
+            const [totalProfit, setTotalProfit] = useState(0);
+            const [tradeHistory, setTradeHistory] = useState([]);
+            const [currentTrade, setCurrentTrade] = useState(null);
+            const [isWaitingForResult, setIsWaitingForResult] = useState(false);
+            const [statistics, setStatistics] = useState({
+                totalTrades: 0,
+                wins: 0,
+                losses: 0,
+                winRate: 0
+            });
+
+            const contractMonitorRef = useRef(null);
+            const settingsRef = useRef({
+                symbol: 'R_100',
+                duration: 1,
+                durationType: 't',
+                maxStake: 100,
+                maxConsecutiveLosses: 5,
+                stopLoss: 1000,
+                targetProfit: 500
+            });
+
+            const updateSettings = useCallback((newSettings) => {
+                settingsRef.current = { ...settingsRef.current, ...newSettings };
+                setBaseStake(newSettings.baseStake || settingsRef.current.baseStake || 1);
+            }, []);
+
+            const calculateMartingaleStake = useCallback((losses) => {
+                const multiplier = Math.pow(2, losses);
+                const calculatedStake = baseStake * multiplier;
+                return Math.min(calculatedStake, settingsRef.current.maxStake);
+            }, [baseStake]);
+
+            const resetTradingState = useCallback(() => {
+                setDigitSequence([]);
+                setCurrentStake(baseStake);
+                setConsecutiveLosses(0);
+                setCurrentTrade(null);
+                setIsWaitingForResult(false);
+                contractMonitorRef.current = null;
+            }, [baseStake]);
+
+            const processNewTick = useCallback((tick) => {
+                if (!isRunning || isWaitingForResult) return;
+
+                const digit = parseInt(tick.lastDigit);
+                
+                setDigitSequence(prev => {
+                    const newSequence = [...prev, digit].slice(-10);
+                    
+                    if (newSequence.length >= 3) {
+                        const lastThree = newSequence.slice(-3);
+                        if (lastThree[0] === lastThree[1] && lastThree[1] === lastThree[2]) {
+                            executeTrade(digit, tick);
+                        }
+                    }
+                    
+                    return newSequence;
+                });
+            }, [isRunning, isWaitingForResult]);
+
+            const executeTrade = useCallback(async (repeatedDigit, tick) => {
+                if (isWaitingForResult || !derivAPI.isAuthenticated) return;
+
+                setIsWaitingForResult(true);
+                
+                try {
+                    const proposalParams = {
+                        contract_type: 'DIGITDIFF',
+                        symbol: settingsRef.current.symbol,
+                        duration: settingsRef.current.duration,
+                        duration_unit: settingsRef.current.durationType,
+                        barrier: repeatedDigit.toString(),
+                        amount: currentStake,
+                        basis: 'stake',
+                        currency: 'USD'
+                    };
+
+                    console.log('Getting proposal for trade:', proposalParams);
+                    
+                    const proposalResponse = await derivAPI.getProposal(proposalParams);
+                    
+                    if (proposalResponse.proposal) {
+                        const proposal = proposalResponse.proposal;
+                        
+                        console.log('Buying contract with proposal ID:', proposal.id);
+                        
+                        const buyResponse = await derivAPI.buyContract(proposal.id, proposal.ask_price);
+                        
+                        if (buyResponse.buy) {
+                            const contract = buyResponse.buy;
+                            
+                            const trade = {
+                                id: contract.contract_id,
+                                timestamp: new Date().toISOString(),
+                                type: 'DIGITDIFF',
+                                symbol: settingsRef.current.symbol,
+                                barrier: repeatedDigit,
+                                stake: currentStake,
+                                buyPrice: contract.buy_price,
+                                status: 'open',
+                                triggerTick: tick
+                            };
+                            
+                            setCurrentTrade(trade);
+                            
+                            contractMonitorRef.current = derivAPI.monitorContract(
+                                contract.contract_id,
+                                handleContractUpdate
+                            );
+                            
+                            console.log('Trade executed:', trade);
+                        }
+                    }
+                } catch (error) {
+                    console.error('Trade execution failed:', error);
+                    setIsWaitingForResult(false);
+                }
+            }, [isWaitingForResult, derivAPI, currentStake]);
+
+            const handleContractUpdate = useCallback((response) => {
+                if (response.proposal_open_contract) {
+                    const contract = response.proposal_open_contract;
+                    
+                    setCurrentTrade(prev => {
+                        if (!prev || prev.id !== contract.contract_id) return prev;
+                        
+                        const updatedTrade = {
+                            ...prev,
+                            status: contract.is_sold ? 'closed' : 'open',
+                            sellPrice: contract.sell_price,
+                            profit: contract.profit,
+                            isWin: contract.profit > 0
+                        };
+                        
+                        if (contract.is_sold) {
+                            processTradeResult(updatedTrade);
+                        }
+                        
+                        return updatedTrade;
+                    });
+                }
+            }, []);
+
+            const processTradeResult = useCallback((trade) => {
+                setIsWaitingForResult(false);
+                
+                setTradeHistory(prev => [trade, ...prev.slice(0, 99)]);
+                
+                setTotalProfit(prev => prev + trade.profit);
+                
+                setStatistics(prev => {
+                    const newStats = {
+                        ...prev,
+                        totalTrades: prev.totalTrades + 1,
+                        wins: trade.isWin ? prev.wins + 1 : prev.wins,
+                        losses: trade.isWin ? prev.losses : prev.losses + 1
+                    };
+                    
+                    newStats.winRate = newStats.totalTrades > 0 ? 
+                        (newStats.wins / newStats.totalTrades * 100).toFixed(2) : 0;
+                    
+                    return newStats;
+                });
+                
+                if (trade.isWin) {
+                    setConsecutiveLosses(0);
+                    setCurrentStake(baseStake);
+                    console.log('Trade won! Resetting stake to base amount:', baseStake);
+                } else {
+                    const newLosses = consecutiveLosses + 1;
+                    setConsecutiveLosses(newLosses);
+                    
+                    const newStake = calculateMartingaleStake(newLosses);
+                    setCurrentStake(newStake);
+                    
+                    console.log(`Trade lost. Consecutive losses: ${newLosses}, New stake: ${newStake}`);
+                    
+                    if (newLosses >= settingsRef.current.maxConsecutiveLosses) {
+                        console.log('Max consecutive losses reached. Stopping bot.');
+                        stopBot();
+                        return;
+                    }
+                }
+                
+                if (totalProfit <= -settingsRef.current.stopLoss) {
+                    console.log('Stop loss reached. Stopping bot.');
+                    stopBot();
+                    return;
+                }
+                
+                if (totalProfit >= settingsRef.current.targetProfit) {
+                    console.log('Target profit reached. Stopping bot.');
+                    stopBot();
+                    return;
+                }
+                
+                setCurrentTrade(null);
+            }, [consecutiveLosses, baseStake, calculateMartingaleStake, totalProfit]);
+
+            const startBot = useCallback(() => {
+                if (!derivAPI.isAuthenticated) {
+                    console.error('Must be authenticated to start bot');
+                    return;
+                }
+                
+                console.log('Starting trading bot...');
+                setIsRunning(true);
+                resetTradingState();
+                
+                derivAPI.subscribeToTicks(settingsRef.current.symbol);
+            }, [derivAPI, resetTradingState]);
+
+            const stopBot = useCallback(() => {
+                console.log('Stopping trading bot...');
+                setIsRunning(false);
+                setIsWaitingForResult(false);
+                setCurrentTrade(null);
+                contractMonitorRef.current = null;
+            }, []);
+
+            const resetBot = useCallback(() => {
+                stopBot();
+                setDigitSequence([]);
+                setCurrentStake(baseStake);
+                setConsecutiveLosses(0);
+                setTotalProfit(0);
+                setTradeHistory([]);
+                setStatistics({
+                    totalTrades: 0,
+                    wins: 0,
+                    losses: 0,
+                    winRate: 0
+                });
+            }, [stopBot, baseStake]);
+
+            useEffect(() => {
+                if (derivAPI.currentTick && isRunning) {
+                    processNewTick(derivAPI.currentTick);
+                }
+            }, [derivAPI.currentTick, isRunning, processNewTick]);
+
+            return {
+                isRunning,
+                digitSequence,
+                currentStake,
+                baseStake,
+                consecutiveLosses,
+                totalProfit,
+                tradeHistory,
+                currentTrade,
+                isWaitingForResult,
+                statistics,
+                startBot,
+                stopBot,
+                resetBot,
+                updateSettings,
+                settings: settingsRef.current
+            };
+        };
+
+        // Components
+        const ConnectionPanel = ({ derivAPI }) => {
+            const [token, setToken] = useState('');
+            const [showToken, setShowToken] = useState(false);
+            const [isConnecting, setIsConnecting] = useState(false);
+
+            const handleConnect = async () => {
+                if (!token.trim()) {
+                    return;
+                }
+
+                setIsConnecting(true);
+                try {
+                    await derivAPI.connect(token);
+                } catch (error) {
+                    console.error('Connection failed:', error);
+                } finally {
+                    setIsConnecting(false);
+                }
+            };
+
+            const handleDisconnect = () => {
+                derivAPI.disconnect();
+                setToken('');
+            };
+
+            const getStatusBadge = () => {
+                switch (derivAPI.connectionStatus) {
+                    case 'connected':
+                        return (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                Connected
+                            </span>
+                        );
+                    case 'connecting':
+                        return (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
+                                Connecting...
+                            </span>
+                        );
+                    case 'disconnected':
+                    default:
+                        return (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
+                                Disconnected
+                            </span>
+                        );
+                }
+            };
+
+            return (
+                <div className="bg-white shadow rounded-lg p-6">
+                    <div className="flex items-center justify-between mb-4">
+                        <div>
+                            <h3 className="text-lg font-medium text-gray-900">API Connection</h3>
+                            <p className="text-sm text-gray-500">Connect to Deriv API using your trading token</p>
+                        </div>
+                        {getStatusBadge()}
+                    </div>
+                    
+                    {!derivAPI.isAuthenticated ? (
+                        <div className="space-y-4">
+                            <div>
+                                <label htmlFor="token" className="block text-sm font-medium text-gray-700">
+                                    API Token
+                                </label>
+                                <div className="mt-1 relative">
+                                    <input
+                                        id="token"
+                                        type={showToken ? 'text' : 'password'}
+                                        placeholder="Enter your Deriv API token"
+                                        value={token}
+                                        onChange={(e) => setToken(e.target.value)}
+                                        className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                                        disabled={isConnecting}
+                                    />
+                                    <button
+                                        type="button"
+                                        className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                                        onClick={() => setShowToken(!showToken)}
+                                        disabled={isConnecting}
+                                    >
+                                        {showToken ? '🙈' : '👁️'}
+                                    </button>
+                                </div>
+                                <p className="mt-1 text-xs text-gray-500">
+                                    Get your API token from{' '}
+                                    <a
+                                        href="https://app.deriv.com/account/api-token"
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-blue-500 hover:underline"
+                                    >
+                                        Deriv Account Settings
+                                    </a>
+                                </p>
+                            </div>
+                            
+                            <button
+                                onClick={handleConnect}
+                                disabled={!token.trim() || isConnecting}
+                                className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                {isConnecting ? (
+                                    <>
+                                        <div className="animate-spin -ml-1 mr-3 h-5 w-5 text-white">⟳</div>
+                                        Connecting...
+                                    </>
+                                ) : (
+                                    'Connect'
+                                )}
+                            </button>
+                        </div>
+                    ) : (
+                        <div className="space-y-4">
+                            <div className="p-3 bg-green-50 border border-green-200 rounded-md">
+                                <p className="text-sm text-green-800">
+                                    ✅ Successfully connected and authenticated
+                                </p>
+                                {derivAPI.accountBalance !== null && (
+                                    <p className="text-sm text-green-700 mt-1">
+                                        Account Balance: ${derivAPI.accountBalance.toFixed(2)}
+                                    </p>
+                                )}
+                            </div>
+                            
+                            <button
+                                onClick={handleDisconnect}
+                                className="w-full flex justify-center py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                            >
+                                Disconnect
+                            </button>
+                        </div>
+                    )}
+
+                    {derivAPI.error && (
+                        <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md">
+                            <p className="text-sm text-red-800">{derivAPI.error}</p>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const DigitCounter = ({ currentTick, digitSequence, isRunning }) => {
+            const formatTime = (epoch) => {
+                return new Date(epoch * 1000).toLocaleTimeString();
+            };
+
+            const getDigitColor = (digit, index) => {
+                if (digitSequence.length >= 3) {
+                    const lastThree = digitSequence.slice(-3);
+                    if (lastThree[0] === lastThree[1] && lastThree[1] === lastThree[2] && index >= digitSequence.length - 3) {
+                        return 'bg-orange-500 text-white animate-pulse';
+                    }
+                }
+                
+                if (index === digitSequence.length - 1) {
+                    return 'bg-blue-500 text-white';
+                }
+                
+                return 'bg-gray-100 text-gray-700';
+            };
+
+            const hasPattern = () => {
+                if (digitSequence.length >= 3) {
+                    const lastThree = digitSequence.slice(-3);
+                    return lastThree[0] === lastThree[1] && lastThree[1] === lastThree[2];
+                }
+                return false;
+            };
+
+            return (
+                <div className="bg-white shadow rounded-lg p-6">
+                    <div className="flex items-center justify-between mb-4">
+                        <div>
+                            <h3 className="text-lg font-medium text-gray-900">Live Digit Counter</h3>
+                            <p className="text-sm text-gray-500">Real-time tick data and digit sequence tracking</p>
+                        </div>
+                        {isRunning && (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                Live
+                            </span>
+                        )}
+                    </div>
+                    
+                    {currentTick ? (
+                        <div className="space-y-6">
+                            <div className="text-center">
+                                <div className="text-4xl font-mono font-bold text-blue-600 mb-2">
+                                    {currentTick.quote.toFixed(5)}
+                                </div>
+                                <div className="text-sm text-gray-500">
+                                    {currentTick.symbol} • {formatTime(currentTick.epoch)}
+                                </div>
+                            </div>
+                            
+                            <div className="text-center">
+                                <div className="text-sm text-gray-500 mb-1">Last Digit</div>
+                                <div className="inline-flex items-center justify-center w-16 h-16 bg-blue-500 text-white text-2xl font-mono font-bold rounded-lg">
+                                    {currentTick.lastDigit}
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="text-center py-8 text-gray-500">
+                            {isRunning ? 'Waiting for tick data...' : 'Connect and start bot to see live data'}
+                        </div>
+                    )}
+
+                    {digitSequence.length > 0 && (
+                        <div className="mt-6 space-y-3">
+                            <div className="flex items-center justify-between">
+                                <h4 className="text-sm font-medium text-gray-900">Recent Digits</h4>
+                                {hasPattern() && (
+                                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 animate-pulse">
+                                        Pattern Detected!
+                                    </span>
+                                )}
+                            </div>
+                            
+                            <div className="flex flex-wrap gap-2 justify-center">
+                                {digitSequence.slice(-10).map((digit, index) => (
+                                    <div
+                                        key={`${digit}-${digitSequence.length - 10 + index}`}
+                                        className={`
+                                            w-10 h-10 rounded-lg flex items-center justify-center
+                                            text-lg font-mono font-bold transition-all duration-300
+                                            ${getDigitColor(digit, digitSequence.length - 10 + index)}
+                                        `}
+                                    >
+                                        {digit}
+                                    </div>
+                                ))}
+                            </div>
+                            
+                            <div className="text-xs text-center text-gray-500">
+                                Showing last {Math.min(digitSequence.length, 10)} digits
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="mt-6 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                        <h4 className="text-sm font-medium text-blue-800 mb-1">
+                            Trading Strategy
+                        </h4>
+                        <p className="text-xs text-blue-700">
+                            Bot will execute a "Digit Differ" trade when any digit repeats 3 times in a row.
+                            The trade predicts that the next tick's last digit will be different from the repeated digit.
+                        </p>
+                    </div>
+                </div>
+            );
+        };
+
+        const TradingControls = ({ tradingBot, isAuthenticated }) => {
+            const [showSettings, setShowSettings] = useState(false);
+            const [settings, setSettings] = useState({
+                baseStake: 1,
+                maxStake: 100,
+                maxConsecutiveLosses: 5,
+                stopLoss: 1000,
+                targetProfit: 500,
+                symbol: 'R_100'
+            });
+
+            const handleSettingsChange = (key, value) => {
+                setSettings(prev => ({
+                    ...prev,
+                    [key]: parseFloat(value) || value
+                }));
+            };
+
+            const applySettings = () => {
+                tradingBot.updateSettings(settings);
+                setShowSettings(false);
+            };
+
+            const getStatusBadge = () => {
+                if (tradingBot.isWaitingForResult) {
+                    return (
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800 animate-pulse">
+                            Waiting for Result
+                        </span>
+                    );
+                }
+                
+                if (tradingBot.isRunning) {
+                    return (
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            Running
+                        </span>
+                    );
+                }
+                
+                return (
+                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
+                        Stopped
+                    </span>
+                );
+            };
+
+            return (
+                <div className="bg-white shadow rounded-lg p-6">
+                    <div className="flex items-center justify-between mb-4">
+                        <div>
+                            <h3 className="text-lg font-medium text-gray-900">Trading Controls</h3>
+                            <p className="text-sm text-gray-500">Start, stop, and configure the trading bot</p>
+                        </div>
+                        {getStatusBadge()}
+                    </div>
+                    
+                    <div className="space-y-4">
+                        <button
+                            onClick={tradingBot.startBot}
+                            disabled={!isAuthenticated || tradingBot.isRunning}
+                            className="w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            ▶️ Start Bot
+                        </button>
+                        
+                        <button
+                            onClick={tradingBot.stopBot}
+                            disabled={!tradingBot.isRunning}
+                            className="w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            ⏹️ Stop Bot
+                        </button>
+                        
+                        <button
+                            onClick={tradingBot.resetBot}
+                            disabled={tradingBot.isRunning}
+                            className="w-full flex justify-center py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            🔄 Reset All Data
+                        </button>
+                    </div>
+
+                    <div className="mt-6 border-t pt-6">
+                        <h4 className="text-sm font-medium text-gray-900 mb-3">Current Settings</h4>
+                        <div className="grid grid-cols-2 gap-3 text-sm">
+                            <div>
+                                <div className="text-gray-500">Base Stake</div>
+                                <div className="font-mono">${tradingBot.baseStake}</div>
+                            </div>
+                            <div>
+                                <div className="text-gray-500">Current Stake</div>
+                                <div className="font-mono font-bold text-blue-600">
+                                    ${tradingBot.currentStake}
+                                </div>
+                            </div>
+                            <div>
+                                <div className="text-gray-500">Consecutive Losses</div>
+                                <div className="font-mono">{tradingBot.consecutiveLosses}</div>
+                            </div>
+                            <div>
+                                <div className="text-gray-500">Symbol</div>
+                                <div className="font-mono">{tradingBot.settings.symbol}</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="mt-6 border-t pt-6">
+                        <h4 className="text-sm font-medium text-gray-900 mb-3">💰 Performance</h4>
+                        <div className="text-center p-3 bg-gray-50 rounded-lg">
+                            <div className="text-sm text-gray-500">Total Profit/Loss</div>
+                            <div className={`text-2xl font-bold font-mono ${
+                                tradingBot.totalProfit >= 0 ? 'text-green-600' : 'text-red-600'
+                            }`}>
+                                ${tradingBot.totalProfit.toFixed(2)}
+                            </div>
+                        </div>
+                        
+                        <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+                            <div className="text-center">
+                                <div className="text-gray-500">Trades</div>
+                                <div className="font-mono">{tradingBot.statistics.totalTrades}</div>
+                            </div>
+                            <div className="text-center">
+                                <div className="text-gray-500">Win Rate</div>
+                                <div className="font-mono">{tradingBot.statistics.winRate}%</div>
+                            </div>
+                            <div className="text-center">
+                                <div className="text-gray-500">W/L</div>
+                                <div className="font-mono">
+                                    {tradingBot.statistics.wins}/{tradingBot.statistics.losses}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="mt-6 border-t pt-6">
+                        <button
+                            onClick={() => setShowSettings(!showSettings)}
+                            className="w-full flex justify-center py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                        >
+                            ⚙️ Configure Settings
+                        </button>
+                        
+                        {showSettings && (
+                            <div className="mt-4 p-4 border border-gray-200 rounded-md bg-gray-50">
+                                <h5 className="text-sm font-medium text-gray-900 mb-3">Trading Bot Settings</h5>
+                                <div className="space-y-3">
+                                    <div className="grid grid-cols-4 items-center gap-2">
+                                        <label className="text-xs text-gray-700">Base Stake</label>
+                                        <input
+                                            type="number"
+                                            min="0.1"
+                                            step="0.1"
+                                            value={settings.baseStake}
+                                            onChange={(e) => handleSettingsChange('baseStake', e.target.value)}
+                                            className="col-span-3 px-2 py-1 text-xs border border-gray-300 rounded"
+                                        />
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-4 items-center gap-2">
+                                        <label className="text-xs text-gray-700">Max Stake</label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            value={settings.maxStake}
+                                            onChange={(e) => handleSettingsChange('maxStake', e.target.value)}
+                                            className="col-span-3 px-2 py-1 text-xs border border-gray-300 rounded"
+                                        />
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-4 items-center gap-2">
+                                        <label className="text-xs text-gray-700">Max Losses</label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            max="10"
+                                            value={settings.maxConsecutiveLosses}
+                                            onChange={(e) => handleSettingsChange('maxConsecutiveLosses', e.target.value)}
+                                            className="col-span-3 px-2 py-1 text-xs border border-gray-300 rounded"
+                                        />
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-4 items-center gap-2">
+                                        <label className="text-xs text-gray-700">Stop Loss</label>
+                                        <input
+                                            type="number"
+                                            min="10"
+                                            value={settings.stopLoss}
+                                            onChange={(e) => handleSettingsChange('stopLoss', e.target.value)}
+                                            className="col-span-3 px-2 py-1 text-xs border border-gray-300 rounded"
+                                        />
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-4 items-center gap-2">
+                                        <label className="text-xs text-gray-700">Target Profit</label>
+                                        <input
+                                            type="number"
+                                            min="10"
+                                            value={settings.targetProfit}
+                                            onChange={(e) => handleSettingsChange('targetProfit', e.target.value)}
+                                            className="col-span-3 px-2 py-1 text-xs border border-gray-300 rounded"
+                                        />
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-4 items-center gap-2">
+                                        <label className="text-xs text-gray-700">Symbol</label>
+                                        <input
+                                            type="text"
+                                            value={settings.symbol}
+                                            onChange={(e) => handleSettingsChange('symbol', e.target.value)}
+                                            className="col-span-3 px-2 py-1 text-xs border border-gray-300 rounded"
+                                        />
+                                    </div>
+                                </div>
+                                <div className="mt-3 flex gap-2">
+                                    <button
+                                        onClick={() => setShowSettings(false)}
+                                        className="flex-1 py-1 px-2 text-xs border border-gray-300 rounded text-gray-700 bg-white hover:bg-gray-50"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={applySettings}
+                                        className="flex-1 py-1 px-2 text-xs border border-transparent rounded text-white bg-blue-600 hover:bg-blue-700"
+                                    >
+                                        Apply Settings
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    {!isAuthenticated && (
+                        <div className="mt-6 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
+                            <p className="text-sm text-yellow-800">
+                                ⚠️ Connect to Deriv API to enable trading controls
+                            </p>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const TradeHistory = ({ tradeHistory, currentTrade, isWaitingForResult }) => {
+            const formatTime = (timestamp) => {
+                return new Date(timestamp).toLocaleTimeString();
+            };
+
+            const formatCurrency = (amount) => {
+                return `$${amount.toFixed(2)}`;
+            };
+
+            const getTradeStatusBadge = (trade) => {
+                if (trade.status === 'open') {
+                    return (
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800 animate-pulse">
+                            Open
+                        </span>
+                    );
+                }
+                
+                if (trade.isWin) {
+                    return (
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            Win
+                        </span>
+                    );
+                } else {
+                    return (
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
+                            Loss
+                        </span>
+                    );
+                }
+            };
+
+            const TradeItem = ({ trade, isCurrent = false }) => (
+                <div className={`p-3 rounded-lg border ${isCurrent ? 'bg-blue-50 border-blue-200' : 'bg-white border-gray-200'}`}>
+                    <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">
+                                {trade.type} • Barrier: {trade.barrier}
+                            </span>
+                            {isCurrent && (
+                                <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
+                                    Current
+                                </span>
+                            )}
+                        </div>
+                        {getTradeStatusBadge(trade)}
+                    </div>
+                    
+                    <div className="grid grid-cols-2 gap-2 text-xs text-gray-500 mb-2">
+                        <div>Stake: {formatCurrency(trade.stake)}</div>
+                        <div>Symbol: {trade.symbol}</div>
+                        <div>Buy Price: {formatCurrency(trade.buyPrice)}</div>
+                        <div>Time: {formatTime(trade.timestamp)}</div>
+                    </div>
+                    
+                    {trade.status === 'closed' && (
+                        <div className="flex items-center justify-between pt-2 border-t border-gray-200">
+                            <span className="text-sm">
+                                Sell Price: {formatCurrency(trade.sellPrice || 0)}
+                            </span>
+                            <span className={`text-sm font-bold ${
+                                trade.profit >= 0 ? 'text-green-600' : 'text-red-600'
+                            }`}>
+                                {trade.profit >= 0 ? '+' : ''}{formatCurrency(trade.profit || 0)}
+                            </span>
+                        </div>
+                    )}
+                    
+                    {trade.triggerTick && (
+                        <div className="mt-2 p-2 bg-gray-50 rounded text-xs">
+                            <div className="text-gray-500">Trigger Tick:</div>
+                            <div className="font-mono">
+                                {trade.triggerTick.quote.toFixed(5)} (Last digit: {trade.triggerTick.lastDigit})
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+
+            return (
+                <div className="bg-white shadow rounded-lg p-6">
+                    <div className="mb-4">
+                        <h3 className="text-lg font-medium text-gray-900">Trade History</h3>
+                        <p className="text-sm text-gray-500">Real-time trading results and performance tracking</p>
+                    </div>
+                    
+                    <div className="max-h-96 overflow-y-auto space-y-3">
+                        {currentTrade && (
+                            <>
+                                <div className="flex items-center gap-2 mb-2">
+                                    <h4 className="text-sm font-medium text-gray-900">Current Trade</h4>
+                                    {isWaitingForResult && (
+                                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800 animate-pulse">
+                                            Waiting for Result
+                                        </span>
+                                    )}
+                                </div>
+                                <TradeItem trade={currentTrade} isCurrent={true} />
+                                <div className="border-t border-gray-200 my-4"></div>
+                            </>
+                        )}
+
+                        {tradeHistory.length > 0 ? (
+                            <>
+                                <h4 className="text-sm font-medium text-gray-900">Recent Trades</h4>
+                                {tradeHistory.map((trade, index) => (
+                                    <TradeItem key={trade.id || index} trade={trade} />
+                                ))}
+                            </>
+                        ) : (
+                            <div className="text-center py-8 text-gray-500">
+                                {currentTrade ? 
+                                    'Previous trades will appear here' : 
+                                    'No trades yet. Start the bot to begin trading.'
+                                }
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // Main App Component
+        const App = () => {
+            const derivAPI = useDerivAPI();
+            const tradingBot = useTradingBot(derivAPI);
+
+            return (
+                <div className="min-h-screen bg-gray-50 p-4">
+                    <div className="max-w-7xl mx-auto">
+                        <div className="mb-6">
+                            <h1 className="text-3xl font-bold text-gray-900 mb-2">
+                                Deriv Trading Bot
+                            </h1>
+                            <p className="text-gray-600">
+                                Automated Digit Differ trading with Martingale strategy
+                            </p>
+                        </div>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            <div className="space-y-6">
+                                <ConnectionPanel derivAPI={derivAPI} />
+                                <TradingControls 
+                                    tradingBot={tradingBot} 
+                                    isAuthenticated={derivAPI.isAuthenticated} 
+                                />
+                            </div>
+
+                            <div>
+                                <DigitCounter
+                                    currentTick={derivAPI.currentTick}
+                                    digitSequence={tradingBot.digitSequence}
+                                    isRunning={tradingBot.isRunning}
+                                />
+                            </div>
+
+                            <div>
+                                <TradeHistory
+                                    tradeHistory={tradingBot.tradeHistory}
+                                    currentTrade={tradingBot.currentTrade}
+                                    isWaitingForResult={tradingBot.isWaitingForResult}
+                                />
+                            </div>
+                        </div>
+
+                        <div className="mt-8 text-center text-sm text-gray-500">
+                            <p>
+                                ⚠️ Trading involves risk. Only trade with money you can afford to lose.
+                            </p>
+                            <p className="mt-1">
+                                This bot is for educational purposes. Use at your own risk.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // Render the app
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
+
